@@ -31,21 +31,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tinystories import Task
 from export import model_export
 
+
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000
-log_interval = 1
-eval_iters = 100
+eval_interval = 5000
+log_interval = 100
+eval_iters = 2
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume'
+init_from = "resume"  # 'scratch' or 'resume'
 # wandb logging
 wandb_log = False  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 16  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 256
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
@@ -57,7 +58,7 @@ n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
-gradient_accumulation_steps = 4  # used to simulate larger batch sizes
+gradient_accumulation_steps = 1  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
@@ -68,8 +69,8 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+device = "mps"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+dtype = "float16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -119,13 +120,14 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
+device_type = "cuda" if "cuda" in device else "mps"  # for later use in torch.autocast
+print(f'device type is {device_type}')
+# note: float16 data type will automatically use a GradScalerg
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 ctx = (
     nullcontext()
-    if device_type == "cpu"
-    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    #if device_type == "cpu"
+    #else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
 # task-specific setup
@@ -157,7 +159,7 @@ model_args = dict(
 if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    gptconf = ModelArgs(**model_args)
+    gptconf = ModelArgs(**model_args) # type: ignore
     model = Transformer(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
@@ -170,7 +172,7 @@ elif init_from == "resume":
     for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = ModelArgs(**model_args)
+    gptconf = ModelArgs(**model_args) # type: ignore
     model = Transformer(gptconf)
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
@@ -182,29 +184,32 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+print(f'putting model to device: {device}')
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
-
+#scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+scaler = torch.cuda.amp.GradScaler(enabled=False)
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == "resume" and "optimizer" in checkpoint:
+if init_from == "resume" and "optimizer" in checkpoint: # type: ignore
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
 # compile the model
+compile = False
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 
+print(f'compile flag is {compile}')
 # wrap model into DDP container
 if ddp:
     # Ignore the `freqs_cis` buffer so that DDP does not broadcast it at
     # construction time since NCCL does not support `ComplexFloat`
     prefix = "_orig_mod." if compile else ""
-    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"} # type: ignore
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -216,6 +221,7 @@ def estimate_loss():
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
+            print(f'Run number : {k+1}')
             X, Y = next(batch_iter)
             with ctx:
                 logits = model(X, Y)
